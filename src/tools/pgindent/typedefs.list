@@ -76,6 +76,7 @@ AlterTSConfigurationStmt
 AlterTSDictionaryStmt
 AlterTableCmd
 AlterTableSpaceOptionsStmt
+AlterTableSpaceMoveStmt
 AlterTableStmt
 AlterTableType
 AlterUserMappingStmt
@@ -895,7 +896,6 @@ LPWSTR
 LSEG
 LVRelStats
 LWLock
-LWLockId
 LWLockMode
 LWLockPadded
 LabelProvider

@@ -6568,6 +6568,15 @@ SELECT SUBSTRING('XY1234Z', 'Y*?([0-9]{1,3})');
        </row>
 
        <row>
+        <entry><literal><function>date_trunc(<type>text</type>, <type>interval</type>)</function></literal></entry>
+        <entry><type>interval</type></entry>
+        <entry>Truncate to specified precision; see also <xref linkend="functions-datetime-trunc">
+        </entry>
+        <entry><literal>date_trunc('hour', interval '2 days 3 hours 40 minutes')</literal></entry>
+        <entry><literal>2 days 03:00:00</literal></entry>
+       </row>
+
+       <row>
         <entry>
          <indexterm>
           <primary>extract</primary>
@@ -10277,6 +10286,27 @@ table2-mapping
       <row>
        <entry>
          <indexterm>
+          <primary>json_array_elements_text</primary>
+         </indexterm>
+         <literal>json_array_elements_text(json)</literal>
+       </entry>
+       <entry><type>SETOF json</type></entry>
+       <entry>
+         Expands a JSON array to a set of text values.
+       </entry>
+       <entry><literal>json_array_elements_text('["foo", "bar"]')</literal></entry>
+       <entry>
+<programlisting>
+   value
+-----------
+ foo
+ bar
+</programlisting>
+       </entry>
+      </row>
+      <row>
+       <entry>
+         <indexterm>
           <primary>json_typeof</primary>
          </indexterm>
          <literal>json_typeof(json)</literal>
@@ -10290,6 +10320,138 @@ table2-mapping
        </entry>
        <entry><literal>json_typeof('-123.4')</literal></entry>
        <entry><literal>number</literal></entry>
+      </row>
+      <row>
+       <entry>
+         <indexterm>
+          <primary>json_build_array</primary>
+         </indexterm>
+         <literal>json_build_array(VARIADIC "any")</literal>
+       </entry>
+       <entry><type>json</type></entry>
+       <entry>
+         Builds a heterogeneously-typed json array out of a variadic argument list.
+       </entry>
+       <entry><literal>SELECT json_build_array(1,2,'3',4,5);</literal></entry>
+       <entry>
+<programlisting>
+ json_build_array
+-------------------
+ [1, 2, "3", 4, 5]
+ </programlisting>
+       </entry>
+      </row>
+      <row>
+       <entry>
+         <indexterm>
+          <primary>json_build_object</primary>
+         </indexterm>
+         <literal>json_build_object(VARIADIC "any")</literal>
+       </entry>
+       <entry><type>json</type></entry>
+       <entry>
+         Builds a JSON array out of a variadic argument list.
+         By convention, the object is 
+         constructed out of alternating name/value arguments.
+       </entry>
+       <entry><literal>SELECT json_build_object('foo',1,'bar',2);</literal></entry>
+       <entry>
+<programlisting>
+   json_build_object
+------------------------
+ {"foo" : 1, "bar" : 2}
+ </programlisting>
+       </entry>
+      </row>
+      <row>
+       <entry>
+         <indexterm>
+          <primary>json_object</primary>
+         </indexterm>
+         <literal>json_object(text[])</literal>
+       </entry>
+       <entry><type>json</type></entry>
+       <entry>
+         Builds a JSON object out of a text array.  The array must have either
+         exactly one dimension with an even number of members, in which case
+         they are taken as alternating name/value pairs, or two dimensions
+         such that each inner array has exactly two elements, which
+         are taken as a name/value pair.
+       </entry>
+       <entry><literal>select * from json_object('{a, 1, b, "def", c, 3.5}')  or <literal>select * from json_object('{{a, 1},{b, "def"},{c, 3.5}}')</literal></literal></entry>
+       <entry>
+<programlisting>
+              json_object
+---------------------------------------
+ {"a" : "1", "b" : "def", "c" : "3.5"}
+ </programlisting>
+       </entry>
+      </row>
+      <row>
+       <entry>
+         <literal>json_object(keys text[], values text[])</literal>
+       </entry>
+       <entry><type>json</type></entry>
+       <entry>
+         The two-argument form of JSON object takes keys and values pairwise from two separate
+         arrays. In all other respects it is identical to the one-argument form.
+       </entry>
+       <entry><literal>select * from json_object('{a, b}', '{1,2}');</literal></entry>
+       <entry>
+<programlisting>
+      json_object
+------------------------
+ {"a" : "1", "b" : "2"}
+ </programlisting>
+       </entry>
+      </row>
+      <row>
+       <entry>
+         <indexterm>
+          <primary>json_to_record</primary>
+         </indexterm>
+         <literal>json_to_record(json, nested_as_text bool)</literal>
+       </entry>
+       <entry><type>record</type></entry>
+       <entry>
+         json_to_record returns an arbitrary record from a JSON object.  As with all functions 
+         returning 'record', the caller must explicitly define the structure of the record 
+         when making the call. The input JSON must be an object, not a scalar or an array.
+         If nested_as_text is true, the function coerces nested complex elements to text.
+         Also, see notes below on columns and types.
+       </entry>
+       <entry><literal>select * from json_to_record('{"a":1,"b":[1,2,3],"c":"bar"}',true) as x(a int, b text, d text) </literal></entry>
+       <entry>
+<programlisting>
+ a |    b    | d 
+---+---------+---
+ 1 | [1,2,3] | 
+ </programlisting>
+       </entry>
+      </row>
+      <row>
+       <entry>
+         <indexterm>
+          <primary>json_to_recordset</primary>
+         </indexterm>
+         <literal>json_to_recordset(json, nested_as_text bool)</literal>
+       </entry>
+       <entry><type>setof record</type></entry>
+       <entry>
+         json_to_recordset returns an arbitrary set of records from a JSON object.  As with 
+         json_to_record, the structure of the record must be explicitly defined when making the
+         call.  However, with json_to_recordset the input JSON must be an array containing 
+         objects.  nested_as_text works as with json_to_record.
+       </entry>
+       <entry><literal>select * from json_to_recordset('[{"a":1,"b":"foo"},{"a":"2","c":"bar"}]',true) as x(a int, b text);</literal></entry>
+       <entry>
+<programlisting>
+ a |  b
+---+-----
+ 1 | foo
+ 2 |
+ </programlisting>
+       </entry>
       </row>
      </tbody>
     </tgroup>
@@ -10317,6 +10479,17 @@ table2-mapping
 
   <note>
     <para>
+       In json_to_record and json_to_recordset, type-coercion from the JSON is
+       "best effort" and may not result in desired values for some types.  JSON
+       elements are matched to identical field names in the record definition,
+       and elements which do not exist in the JSON will simply be NULL.  JSON
+       elements which are not defined in the record template will
+       be omitted from the output.
+    </para>
+  </note>
+
+  <note>
+    <para>
       The <xref linkend="hstore"> extension has a cast from <type>hstore</type> to
       <type>json</type>, so that converted <type>hstore</type> values are represented as JSON objects,
       not as string values.
@@ -10334,7 +10507,9 @@ table2-mapping
   <para>
     See also <xref linkend="functions-aggregate"> about the aggregate
     function <function>json_agg</function> which aggregates record
-    values as JSON efficiently.
+    values as JSON efficiently, and the aggregate function
+    <function>json_object_agg</function>, which aggregates pairs of values
+    into a JSON object.
   </para>
  </sect1>
 
@@ -11009,6 +11184,9 @@ SELECT NULLIF(value, '(none)') ...
     <primary>array_upper</primary>
   </indexterm>
   <indexterm>
+    <primary>cardinality</primary>
+  </indexterm>
+  <indexterm>
     <primary>string_to_array</primary>
   </indexterm>
   <indexterm>
@@ -11162,6 +11340,17 @@ SELECT NULLIF(value, '(none)') ...
         <entry><type>int</type></entry>
         <entry>returns upper bound of the requested array dimension</entry>
         <entry><literal>array_upper(ARRAY[1,8,3,7], 1)</literal></entry>
+        <entry><literal>4</literal></entry>
+       </row>
+       <row>
+        <entry>
+         <literal>
+          <function>cardinality</function>(<type>anyarray</type>)
+         </literal>
+        </entry>
+        <entry><type>int</type></entry>
+        <entry>returns the total number of elements in the array, or 0 if the array is empty</entry>
+        <entry><literal>cardinality(ARRAY[[1,2],[3,4]])</literal></entry>
         <entry><literal>4</literal></entry>
        </row>
        <row>
@@ -11752,6 +11941,22 @@ NULL baz</literallayout>(3 rows)</entry>
      <row>
       <entry>
        <indexterm>
+        <primary>json_object_agg</primary>
+       </indexterm>
+       <function>json_object_agg(<replaceable class="parameter">expression</replaceable>)</function>
+      </entry>
+      <entry>
+       <type>("any", "any")</type>
+      </entry>
+      <entry>
+       <type>json</type>
+      </entry>
+      <entry>aggregates name/value pairs as a JSON object</entry>
+     </row>
+
+     <row>
+      <entry>
+       <indexterm>
         <primary>max</primary>
        </indexterm>
        <function>max(<replaceable class="parameter">expression</replaceable>)</function>
@@ -11895,6 +12100,7 @@ SELECT count(*) FROM sometable;
   <para>
    The aggregate functions <function>array_agg</function>,
    <function>json_agg</function>,
+   <function>json_object_agg</function>,
    <function>string_agg</function>,
    and <function>xmlagg</function>, as well as similar user-defined
    aggregate functions, produce meaningfully different result values
