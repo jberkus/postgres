@@ -1,5 +1,35 @@
 /*
  * contrib/hstore/hstore_compat.c
+
+Current nested hstore layout (see historical notes below):
+
+Hstore consists of varlena header, 4 bits (special flags), 28 bits for
+nelems/npairs, array of hentries and element array. Special flags are
+HS_FLAG_NEWVERSION,  HS_FLAG_ARRAY, HS_FLAG_HASH, HS_FLAG_SCALAR. Hentry
+starts from 4 special bits: 1st bit (ISFIRST) is set if there is no previous
+entry, next 3 bits are used to indicate type of hstore value (ISSTRING,
+ISNUMERIC, ISNEST, ISNULL, ISBOOL). Other 28 bits are ending position of
+hentry value relative to the beginning of element array.
+
+Hash key-value accessed as follow:
+first key starts from zero and ends at Hentry[0],i-th key starts from
+Hentry[i*2-1] and ends at Hentry[i*2], i-th value starts from
+align(HEntry[i*2]) and ends at HEntry[i*2 + 1]. Key-Value pairs are
+lexicographically ordered by keys.
+
+Array's first element starts from zero and ends at Hentry[0], and
+i-th element starts from align(HEntry[i - 1]) and ends at HEntry[i]. Elements
+are not ordered.
+
+Notes:
+Scalar stored as a single-element array.
+
+Limitations:
+Number of elements in array: 2^28
+Number of pairs in hash: 2^28
+Length of string: 2^28 bytes
+Length of nested hash or array: 2^28 bytes
+
  *
  * Notes on old/new hstore format disambiguation.
  *
@@ -12,8 +42,6 @@
  * (3) and (4) are upward binary compatible.
  * (2) and (3) are identical except for the HS_FLAG_NEWVERSION
  * bit, which is set in (3) but not (2).
- * (4) has HS_FLAG_ARRAY, HS_FLAG_HASH, HS_FLAG_SCALAR bits after
- * HS_FLAG_NEWVERSION  
  *
  * Values that are already in format (3), or which are
  * unambiguously in format (2), are handled by the first
