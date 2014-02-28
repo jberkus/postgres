@@ -30,10 +30,10 @@ typedef struct
 #define HENTRY_ISFALSE		HENTRY_ISBOOL
 #define HENTRY_ISTRUE		(0x10000000 | 0x20000000 | 0x40000000)
 
-/* HENTRY_ISHASH, HENTRY_ISARRAY and HENTRY_ISCALAR is only used in send/recv */
+/* HENTRY_ISHASH, HENTRY_ISARRAY and HENTRY_ISSCALAR is only used in send/recv */
 #define HENTRY_ISHASH		(0x20000000)
 #define HENTRY_ISARRAY		(0x20000000 | 0x40000000)
-#define HENTRY_ISCALAR		(0x10000000 | 0x40000000)
+#define HENTRY_ISSCALAR		(0x10000000 | 0x40000000)
 
 #define HENTRY_POSMASK 	0x0FFFFFFF
 #define HENTRY_TYPEMASK	(~(HENTRY_POSMASK | HENTRY_ISFIRST))
@@ -74,9 +74,12 @@ typedef struct
 } HStore;
 
 /*
- * it's not possible to get more than 2^28 items into an hstore,
- * so we reserve the top few bits of the size field. See hstore_compat.c
- * for one reason why.	Some bits are left for future use here.
+ * It's not possible to get more than 2^28 items into an hstore, so we reserve
+ * the top few bits of the size field.  See hstore_compat.c for one reason
+ * why.  Some bits are left for future use here.  MaxAllocSize makes the
+ * practical count limit slightly more than 2^28 / 3, or INT_MAX / 24, the
+ * limit for an hstore full of 4-byte keys and null values.  Therefore, we
+ * don't explicitly check the format-imposed limit.
  */
 #define HS_FLAG_NEWVERSION 		0x80000000
 #define HS_FLAG_ARRAY			0x40000000

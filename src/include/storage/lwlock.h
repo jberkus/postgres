@@ -80,7 +80,7 @@ typedef union LWLockPadded
 	LWLock		lock;
 	char		pad[LWLOCK_PADDED_SIZE];
 } LWLockPadded;
-extern LWLockPadded *MainLWLockArray;
+extern PGDLLIMPORT LWLockPadded *MainLWLockArray;
 
 /*
  * Some commonly-used locks have predefined positions within MainLWLockArray;
@@ -125,7 +125,9 @@ extern LWLockPadded *MainLWLockArray;
 #define BackgroundWorkerLock		(&MainLWLockArray[33].lock)
 #define DynamicSharedMemoryControlLock		(&MainLWLockArray[34].lock)
 #define AutoFileLock				(&MainLWLockArray[35].lock)
-#define NUM_INDIVIDUAL_LWLOCKS		36
+#define ReplicationSlotAllocationLock	(&MainLWLockArray[36].lock)
+#define ReplicationSlotControlLock		(&MainLWLockArray[37].lock)
+#define NUM_INDIVIDUAL_LWLOCKS		38
 
 /*
  * It's a bit odd to declare NUM_BUFFER_PARTITIONS and NUM_LOCK_PARTITIONS

@@ -39,6 +39,7 @@
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/startup.h"
+#include "replication/slot.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/barrier.h"
@@ -127,7 +128,7 @@ const struct config_enum_entry sync_method_options[] = {
 
 /*
  * Statistics for current checkpoint are collected in this global struct.
- * Because only the background writer or a stand-alone backend can perform
+ * Because only the checkpointer or a stand-alone backend can perform
  * checkpoints, this will be unused in normal backends.
  */
 CheckpointStatsData CheckpointStats;
@@ -225,6 +226,7 @@ static TimestampTz recoveryDelayUntilTime;
 /* options taken from recovery.conf for XLOG streaming */
 static bool StandbyModeRequested = false;
 static char *PrimaryConnInfo = NULL;
+static char *PrimarySlotName = NULL;
 static char *TriggerFile = NULL;
 
 /* are we currently in standby mode? */
@@ -485,6 +487,8 @@ typedef struct XLogCtlData
 	uint32		ckptXidEpoch;	/* nextXID & epoch of latest checkpoint */
 	TransactionId ckptXid;
 	XLogRecPtr	asyncXactLSN;	/* LSN of newest async commit/abort */
+	XLogRecPtr	replicationSlotMinLSN;	/* oldest LSN needed by any slot */
+
 	XLogSegNo	lastRemovedSegNo;		/* latest removed/recycled XLOG
 										 * segment */
 
@@ -748,6 +752,7 @@ static void LocalSetXLogInsertAllowed(void);
 static void CreateEndOfRecoveryRecord(void);
 static void CheckPointGuts(XLogRecPtr checkPointRedo, int flags);
 static void KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo);
+static XLogRecPtr XLogGetReplicationSlotMinimumLSN(void);
 
 static bool XLogCheckBuffer(XLogRecData *rdata, bool holdsExclusiveLock,
 				XLogRecPtr *lsn, BkpBlock *bkpb);
@@ -1837,15 +1842,14 @@ WakeupWaiters(XLogRecPtr EndPos)
 	slot->xlogInsertingAt = EndPos;
 
 	/*
-	 * See if there are any waiters that need to be woken up.
+	 * See if there are any LW_WAIT_UNTIL_FREE waiters that need to be woken
+	 * up. They are always in the front of the queue.
 	 */
 	head = slot->head;
 
-	if (head != NULL)
+	if (head != NULL && head->lwWaitMode == LW_WAIT_UNTIL_FREE)
 	{
 		proc = head;
-
-		/* LW_WAIT_UNTIL_FREE waiters are always in the front of the queue */
 		next = proc->lwWaitLink;
 		while (next && next->lwWaitMode == LW_WAIT_UNTIL_FREE)
 		{
@@ -1857,6 +1861,8 @@ WakeupWaiters(XLogRecPtr EndPos)
 		slot->head = next;
 		proc->lwWaitLink = NULL;
 	}
+	else
+		head = NULL;
 
 	/* We are done updating shared state of the lock itself. */
 	SpinLockRelease(&slot->mutex);
@@ -2906,6 +2912,39 @@ XLogSetAsyncXactLSN(XLogRecPtr asyncXactLSN)
 	 */
 	if (ProcGlobal->walwriterLatch)
 		SetLatch(ProcGlobal->walwriterLatch);
+}
+
+/*
+ * Record the LSN up to which we can remove WAL because it's not required by
+ * any replication slot.
+ */
+void
+XLogSetReplicationSlotMinimumLSN(XLogRecPtr lsn)
+{
+	/* use volatile pointer to prevent code rearrangement */
+	volatile XLogCtlData *xlogctl = XLogCtl;
+
+	SpinLockAcquire(&xlogctl->info_lck);
+	xlogctl->replicationSlotMinLSN = lsn;
+	SpinLockRelease(&xlogctl->info_lck);
+}
+
+
+/*
+ * Return the oldest LSN we must retain to satisfy the needs of some
+ * replication slot.
+ */
+static XLogRecPtr
+XLogGetReplicationSlotMinimumLSN(void)
+{
+	/* use volatile pointer to prevent code rearrangement */
+	volatile XLogCtlData *xlogctl = XLogCtl;
+	XLogRecPtr		retval;
+	SpinLockAcquire(&xlogctl->info_lck);
+	retval = xlogctl->replicationSlotMinLSN;
+	SpinLockRelease(&xlogctl->info_lck);
+
+	return retval;
 }
 
 /*
@@ -4855,7 +4894,7 @@ ReadControlFile(void)
 				 errhint("It looks like you need to recompile or initdb.")));
 #endif
 
-	/* Make the fixed  settings visible as GUC variables, too */
+	/* Make the initdb settings visible as GUC variables, too */
 	SetConfigOption("data_checksums", DataChecksumsEnabled() ? "yes" : "no",
 					PGC_INTERNAL, PGC_S_OVERRIDE);
 }
@@ -5478,6 +5517,14 @@ readRecoveryCommandFile(void)
 					(errmsg_internal("primary_conninfo = '%s'",
 									 PrimaryConnInfo)));
 		}
+		else if (strcmp(item->name, "primary_slotname") == 0)
+		{
+			ReplicationSlotValidateName(item->value, ERROR);
+			PrimarySlotName = pstrdup(item->value);
+			ereport(DEBUG2,
+					(errmsg_internal("primary_slotname = '%s'",
+									 PrimarySlotName)));
+		}
 		else if (strcmp(item->name, "trigger_file") == 0)
 		{
 			TriggerFile = pstrdup(item->value);
@@ -5797,7 +5844,7 @@ recoveryStopsAfter(XLogRecord *record)
 			recoveryStopAfter = true;
 			recoveryStopXid = InvalidTransactionId;
 			(void) getRecordTimestamp(record, &recoveryStopTime);
-			strncpy(recoveryStopName, recordRestorePointData->rp_name, MAXFNAMELEN);
+			strlcpy(recoveryStopName, recordRestorePointData->rp_name, MAXFNAMELEN);
 
 			ereport(LOG,
 					(errmsg("recovery stopping at restore point \"%s\", time %s",
@@ -6264,7 +6311,7 @@ StartupXLOG(void)
 	 * Save archive_cleanup_command in shared memory so that other processes
 	 * can see it.
 	 */
-	strncpy(XLogCtl->archiveCleanupCommand,
+	strlcpy(XLogCtl->archiveCleanupCommand,
 			archiveCleanupCommand ? archiveCleanupCommand : "",
 			sizeof(XLogCtl->archiveCleanupCommand));
 
@@ -6504,6 +6551,12 @@ StartupXLOG(void)
 	SetMultiXactIdLimit(checkPoint.oldestMulti, checkPoint.oldestMultiDB);
 	XLogCtl->ckptXidEpoch = checkPoint.nextXidEpoch;
 	XLogCtl->ckptXid = checkPoint.nextXid;
+
+	/*
+	 * Initialize replication slots, before there's a chance to remove
+	 * required resources.
+	 */
+	StartupReplicationSlots(checkPoint.redo);
 
 	/*
 	 * Startup MultiXact.  We need to do this early for two reasons: one
@@ -8620,6 +8673,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointMultiXact();
 	CheckPointPredicate();
 	CheckPointRelationMap();
+	CheckPointReplicationSlots();
 	CheckPointBuffers(flags);	/* performs all required fsyncs */
 	/* We deliberately delay 2PC checkpointing as long as possible */
 	CheckPointTwoPhase(checkPointRedo);
@@ -8938,24 +8992,43 @@ CreateRestartPoint(int flags)
 
 /*
  * Retreat *logSegNo to the last segment that we need to retain because of
- * wal_keep_segments. This is calculated by subtracting wal_keep_segments
- * from the given xlog location, recptr.
+ * either wal_keep_segments or replication slots.
+ *
+ * This is calculated by subtracting wal_keep_segments from the given xlog
+ * location, recptr and by making sure that that result is below the
+ * requirement of replication slots.
  */
 static void
 KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 {
 	XLogSegNo	segno;
-
-	if (wal_keep_segments == 0)
-		return;
+	XLogRecPtr	keep;
 
 	XLByteToSeg(recptr, segno);
+	keep = XLogGetReplicationSlotMinimumLSN();
 
-	/* avoid underflow, don't go below 1 */
-	if (segno <= wal_keep_segments)
-		segno = 1;
-	else
-		segno = segno - wal_keep_segments;
+	/* compute limit for wal_keep_segments first */
+	if (wal_keep_segments > 0)
+	{
+		/* avoid underflow, don't go below 1 */
+		if (segno <= wal_keep_segments)
+			segno = 1;
+		else
+			segno = segno - wal_keep_segments;
+	}
+
+	/* then check whether slots limit removal further */
+	if (max_replication_slots > 0 && keep != InvalidXLogRecPtr)
+	{
+		XLogRecPtr slotSegNo;
+
+		XLByteToSeg(keep, slotSegNo);
+
+		if (slotSegNo <= 0)
+			segno = 1;
+		else if (slotSegNo < segno)
+			segno = slotSegNo;
+	}
 
 	/* don't delete WAL segments newer than the calculated segment */
 	if (segno < *logSegNo)
@@ -9034,7 +9107,7 @@ XLogRestorePoint(const char *rpName)
 	xl_restore_point xlrec;
 
 	xlrec.rp_time = GetCurrentTimestamp();
-	strncpy(xlrec.rp_name, rpName, MAXFNAMELEN);
+	strlcpy(xlrec.rp_name, rpName, MAXFNAMELEN);
 
 	rdata.buffer = InvalidBuffer;
 	rdata.data = (char *) &xlrec;
@@ -10933,17 +11006,15 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 	/*-------
 	 * Standby mode is implemented by a state machine:
 	 *
-	 * 1. Read from archive (XLOG_FROM_ARCHIVE)
-	 * 2. Read from pg_xlog (XLOG_FROM_PG_XLOG)
-	 * 3. Check trigger file
-	 * 4. Read from primary server via walreceiver (XLOG_FROM_STREAM)
-	 * 5. Rescan timelines
-	 * 6. Sleep 5 seconds, and loop back to 1.
+	 * 1. Read from either archive or pg_xlog (XLOG_FROM_ARCHIVE), or just
+	 *    pg_xlog (XLOG_FROM_XLOG)
+	 * 2. Check trigger file
+	 * 3. Read from primary server via walreceiver (XLOG_FROM_STREAM)
+	 * 4. Rescan timelines
+	 * 5. Sleep 5 seconds, and loop back to 1.
 	 *
 	 * Failure to read from the current source advances the state machine to
-	 * the next state. In addition, successfully reading a file from pg_xlog
-	 * moves the state machine from state 2 back to state 1 (we always prefer
-	 * files in the archive over files in pg_xlog).
+	 * the next state.
 	 *
 	 * 'currentSource' indicates the current state. There are no currentSource
 	 * values for "check trigger", "rescan timelines", and "sleep" states,
@@ -10971,9 +11042,6 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 			switch (currentSource)
 			{
 				case XLOG_FROM_ARCHIVE:
-					currentSource = XLOG_FROM_PG_XLOG;
-					break;
-
 				case XLOG_FROM_PG_XLOG:
 
 					/*
@@ -11026,7 +11094,8 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 									 tli, curFileTLI);
 						}
 						curFileTLI = tli;
-						RequestXLogStreaming(tli, ptr, PrimaryConnInfo);
+						RequestXLogStreaming(tli, ptr, PrimaryConnInfo,
+											 PrimarySlotName);
 						receivedUpto = 0;
 					}
 
@@ -11138,7 +11207,9 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 				 * Try to restore the file from archive, or read an existing
 				 * file from pg_xlog.
 				 */
-				readFile = XLogFileReadAnyTLI(readSegNo, DEBUG2, currentSource);
+				readFile = XLogFileReadAnyTLI(readSegNo, DEBUG2,
+						currentSource == XLOG_FROM_ARCHIVE ? XLOG_FROM_ANY :
+										 currentSource);
 				if (readFile >= 0)
 					return true;	/* success! */
 
@@ -11262,9 +11333,9 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 		 * process.
 		 */
 		HandleStartupProcInterrupts();
-	} while (StandbyMode);
+	}
 
-	return false;
+	return false; 	/* not reached */
 }
 
 /*

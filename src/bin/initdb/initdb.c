@@ -180,7 +180,7 @@ static const char *backend_options = "--single -F -O -c search_path=pg_catalog -
 #ifdef WIN32
 char	   *restrict_env;
 #endif
-const char *subdirs[] = {
+static const char *subdirs[] = {
 	"global",
 	"pg_xlog",
 	"pg_xlog/archive_status",
@@ -195,6 +195,7 @@ const char *subdirs[] = {
 	"pg_multixact/offsets",
 	"base",
 	"base/1",
+	"pg_replslot",
 	"pg_tblspc",
 	"pg_stat",
 	"pg_stat_tmp"

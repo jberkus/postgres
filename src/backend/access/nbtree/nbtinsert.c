@@ -21,7 +21,6 @@
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
-#include "utils/inval.h"
 #include "utils/tqual.h"
 
 
@@ -84,8 +83,8 @@ static void _bt_vacuum_one_page(Relation rel, Buffer buffer, Relation heapRel);
 /*
  *	_bt_doinsert() -- Handle insertion of a single index tuple in the tree.
  *
- *		This routine is called by the public interface routines, btbuild
- *		and btinsert.  By here, itup is filled in, including the TID.
+ *		This routine is called by the public interface routine, btinsert.
+ *		By here, itup is filled in, including the TID.
  *
  *		If checkUnique is UNIQUE_CHECK_NO or UNIQUE_CHECK_PARTIAL, this
  *		will allow duplicates.	Otherwise (UNIQUE_CHECK_YES or
@@ -868,13 +867,9 @@ _bt_insertonpg(Relation rel,
 
 		END_CRIT_SECTION();
 
-		/* release buffers; send out relcache inval if metapage changed */
+		/* release buffers */
 		if (BufferIsValid(metabuf))
-		{
-			if (!InRecovery)
-				CacheInvalidateRelcache(rel);
 			_bt_relbuf(rel, metabuf);
-		}
 
 		_bt_relbuf(rel, buf);
 	}
@@ -1962,10 +1957,6 @@ _bt_newroot(Relation rel, Buffer lbuf, Buffer rbuf)
 	}
 
 	END_CRIT_SECTION();
-
-	/* send out relcache inval for metapage change */
-	if (!InRecovery)
-		CacheInvalidateRelcache(rel);
 
 	/* done with metapage */
 	_bt_relbuf(rel, metabuf);

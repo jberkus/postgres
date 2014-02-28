@@ -1036,6 +1036,9 @@ recalc:
 static int
 tm2interval(struct tm * tm, fsec_t fsec, interval * span)
 {
+	if ((double)tm->tm_year * MONTHS_PER_YEAR + tm->tm_mon > INT_MAX ||
+		(double)tm->tm_year * MONTHS_PER_YEAR + tm->tm_mon < INT_MIN)
+		return -1;
 	span->month = tm->tm_year * MONTHS_PER_YEAR + tm->tm_mon;
 #ifdef HAVE_INT64_TIMESTAMP
 	span->time = (((((((tm->tm_mday * INT64CONST(24)) +
@@ -1091,7 +1094,7 @@ PGTYPESinterval_from_asc(char *str, char **endptr)
 	tm->tm_sec = 0;
 	fsec = 0;
 
-	if (strlen(str) >= sizeof(lowstr))
+	if (strlen(str) > MAXDATELEN)
 	{
 		errno = PGTYPES_INTVL_BAD_INTERVAL;
 		return NULL;

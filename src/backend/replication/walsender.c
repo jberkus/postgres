@@ -53,6 +53,7 @@
 #include "miscadmin.h"
 #include "nodes/replnodes.h"
 #include "replication/basebackup.h"
+#include "replication/slot.h"
 #include "replication/syncrep.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
@@ -66,6 +67,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#include "utils/pg_lsn.h"
 #include "utils/ps_status.h"
 #include "utils/resowner.h"
 #include "utils/timeout.h"
@@ -218,11 +220,16 @@ InitWalSender(void)
 void
 WalSndErrorCleanup()
 {
+	LWLockReleaseAll();
+
 	if (sendFile >= 0)
 	{
 		close(sendFile);
 		sendFile = -1;
 	}
+
+	if (MyReplicationSlot != NULL)
+		ReplicationSlotRelease();
 
 	replication_active = false;
 	if (walsender_ready_to_stop)
@@ -421,6 +428,15 @@ StartReplication(StartReplicationCmd *cmd)
 	 * written at wal_level='minimal'.
 	 */
 
+	if (cmd->slotname)
+	{
+		ReplicationSlotAcquire(cmd->slotname);
+		if (MyReplicationSlot->data.database != InvalidOid)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 (errmsg("cannot use a replication slot created for changeset extraction for streaming replication"))));
+	}
+
 	/*
 	 * Select the timeline. If it was given explicitly by the client, use
 	 * that. Otherwise use the timeline of the last replayed record, which is
@@ -565,6 +581,9 @@ StartReplication(StartReplicationCmd *cmd)
 		Assert(streamingDoneSending && streamingDoneReceiving);
 	}
 
+	if (cmd->slotname)
+		ReplicationSlotRelease();
+
 	/*
 	 * Copy is finished now. Send a single-row result set indicating the next
 	 * timeline.
@@ -623,6 +642,75 @@ StartReplication(StartReplicationCmd *cmd)
 }
 
 /*
+ * Create a new replication slot.
+ */
+static void
+CreateReplicationSlot(CreateReplicationSlotCmd *cmd)
+{
+	const char *slot_name;
+	StringInfoData buf;
+
+	Assert(!MyReplicationSlot);
+
+	/* setup state for XLogReadPage */
+	sendTimeLineIsHistoric = false;
+	sendTimeLine = ThisTimeLineID;
+
+	ReplicationSlotCreate(cmd->slotname, cmd->kind == REPLICATION_KIND_LOGICAL);
+
+	initStringInfo(&output_message);
+
+	slot_name = NameStr(MyReplicationSlot->data.name);
+
+	/*
+	 * It may seem somewhat pointless to send back the same slot name the
+	 * client just requested and nothing else, but logical replication
+	 * will add more fields here.  (We could consider removing the slot
+	 * name from what's sent back, though, since the client has specified
+	 * that.)
+	 */
+
+	pq_beginmessage(&buf, 'T');
+	pq_sendint(&buf, 1, 2);		/* 1 field */
+
+	/* first field: slot name */
+	pq_sendstring(&buf, "slot_name");	/* col name */
+	pq_sendint(&buf, 0, 4);		/* table oid */
+	pq_sendint(&buf, 0, 2);		/* attnum */
+	pq_sendint(&buf, TEXTOID, 4);		/* type oid */
+	pq_sendint(&buf, -1, 2);	/* typlen */
+	pq_sendint(&buf, 0, 4);		/* typmod */
+	pq_sendint(&buf, 0, 2);		/* format code */
+
+	pq_endmessage(&buf);
+
+	/* Send a DataRow message */
+	pq_beginmessage(&buf, 'D');
+	pq_sendint(&buf, 1, 2);		/* # of columns */
+
+	/* slot_name */
+	pq_sendint(&buf, strlen(slot_name), 4); /* col1 len */
+	pq_sendbytes(&buf, slot_name, strlen(slot_name));
+
+	pq_endmessage(&buf);
+
+	/*
+	 * release active status again, START_REPLICATION will reacquire it
+	 */
+	ReplicationSlotRelease();
+}
+
+/*
+ * Get rid of a replication slot that is no longer wanted.
+ */
+static void
+DropReplicationSlot(DropReplicationSlotCmd *cmd)
+{
+	ReplicationSlotDrop(cmd->slotname);
+	EndCommand("DROP_REPLICATION_SLOT", DestRemote);
+}
+
+/*
  * Execute an incoming replication command.
  */
 void
@@ -660,13 +748,27 @@ exec_replication_command(const char *cmd_string)
 			IdentifySystem();
 			break;
 
-		case T_StartReplicationCmd:
-			StartReplication((StartReplicationCmd *) cmd_node);
-			break;
-
 		case T_BaseBackupCmd:
 			SendBaseBackup((BaseBackupCmd *) cmd_node);
 			break;
+
+		case T_CreateReplicationSlotCmd:
+			CreateReplicationSlot((CreateReplicationSlotCmd *) cmd_node);
+			break;
+
+		case T_DropReplicationSlotCmd:
+			DropReplicationSlot((DropReplicationSlotCmd *) cmd_node);
+			break;
+
+		case T_StartReplicationCmd:
+			{
+				StartReplicationCmd *cmd = (StartReplicationCmd *) cmd_node;
+				if (cmd->kind == REPLICATION_KIND_PHYSICAL)
+					StartReplication(cmd);
+				else
+					elog(ERROR, "cannot handle changeset extraction yet");
+				break;
+			}
 
 		case T_TimeLineHistoryCmd:
 			SendTimeLineHistory((TimeLineHistoryCmd *) cmd_node);
@@ -831,6 +933,39 @@ ProcessStandbyMessage(void)
 }
 
 /*
+ * Remember that a walreceiver just confirmed receipt of lsn `lsn`.
+ */
+static void
+PhysicalConfirmReceivedLocation(XLogRecPtr lsn)
+{
+	bool changed = false;
+	/* use volatile pointer to prevent code rearrangement */
+	volatile ReplicationSlot *slot = MyReplicationSlot;
+
+	Assert(lsn != InvalidXLogRecPtr);
+	SpinLockAcquire(&slot->mutex);
+	if (slot->data.restart_lsn != lsn)
+	{
+		changed = true;
+		slot->data.restart_lsn = lsn;
+	}
+	SpinLockRelease(&slot->mutex);
+
+	if (changed)
+	{
+		ReplicationSlotMarkDirty();
+		ReplicationSlotsComputeRequiredLSN();
+	}
+
+	/*
+	 * One could argue that the slot should be saved to disk now, but that'd be
+	 * energy wasted - the worst lost information can do here is give us wrong
+	 * information in a statistics view - we'll just potentially be more
+	 * conservative in removing files.
+	 */
+}
+
+/*
  * Regular reply from standby advising of WAL positions on standby server.
  */
 static void
@@ -875,6 +1010,48 @@ ProcessStandbyReplyMessage(void)
 
 	if (!am_cascading_walsender)
 		SyncRepReleaseWaiters();
+
+	/*
+	 * Advance our local xmin horizon when the client confirmed a flush.
+	 */
+	if (MyReplicationSlot && flushPtr != InvalidXLogRecPtr)
+	{
+		if (MyReplicationSlot->data.database != InvalidOid)
+			elog(ERROR, "cannot handle changeset extraction yet");
+		else
+			PhysicalConfirmReceivedLocation(flushPtr);
+	}
+}
+
+/* compute new replication slot xmin horizon if needed */
+static void
+PhysicalReplicationSlotNewXmin(TransactionId feedbackXmin)
+{
+	bool changed = false;
+	volatile ReplicationSlot *slot = MyReplicationSlot;
+
+	SpinLockAcquire(&slot->mutex);
+	MyPgXact->xmin = InvalidTransactionId;
+	/*
+	 * For physical replication we don't need the interlock provided
+	 * by xmin and effective_xmin since the consequences of a missed increase
+	 * are limited to query cancellations, so set both at once.
+	 */
+	if (!TransactionIdIsNormal(slot->data.xmin) ||
+		!TransactionIdIsNormal(feedbackXmin) ||
+		TransactionIdPrecedes(slot->data.xmin, feedbackXmin))
+	{
+		changed = true;
+		slot->data.xmin = feedbackXmin;
+		slot->effective_xmin = feedbackXmin;
+	}
+	SpinLockRelease(&slot->mutex);
+
+	if (changed)
+	{
+		ReplicationSlotMarkDirty();
+		ReplicationSlotsComputeRequiredXmin();
+	}
 }
 
 /*
@@ -904,6 +1081,8 @@ ProcessStandbyHSFeedbackMessage(void)
 	if (!TransactionIdIsNormal(feedbackXmin))
 	{
 		MyPgXact->xmin = InvalidTransactionId;
+		if (MyReplicationSlot != NULL)
+			PhysicalReplicationSlotNewXmin(feedbackXmin);
 		return;
 	}
 
@@ -951,8 +1130,17 @@ ProcessStandbyHSFeedbackMessage(void)
 	 * GetOldestXmin.  (If we're moving our xmin forward, this is obviously
 	 * safe, and if we're moving it backwards, well, the data is at risk
 	 * already since a VACUUM could have just finished calling GetOldestXmin.)
+	 *
+	 * If we're using a replication slot we reserve the xmin via that,
+	 * otherwise via the walsender's PGXACT entry.
+
+	 * XXX: It might make sense to introduce ephemeral slots and always use
+	 * the slot mechanism.
 	 */
-	MyPgXact->xmin = feedbackXmin;
+	if (MyReplicationSlot != NULL) /* XXX: persistency configurable? */
+		PhysicalReplicationSlotNewXmin(feedbackXmin);
+	else
+		MyPgXact->xmin = feedbackXmin;
 }
 
 /* Main loop of walsender process that streams the WAL over Copy messages. */
@@ -1214,17 +1402,23 @@ InitWalSenderSlot(void)
 static void
 WalSndKill(int code, Datum arg)
 {
-	Assert(MyWalSnd != NULL);
+	WalSnd	   *walsnd = MyWalSnd;
+
+	Assert(walsnd != NULL);
+
+	/*
+	 * Clear MyWalSnd first; then disown the latch.  This is so that signal
+	 * handlers won't try to touch the latch after it's no longer ours.
+	 */
+	MyWalSnd = NULL;
+
+	DisownLatch(&walsnd->latch);
 
 	/*
 	 * Mark WalSnd struct no longer in use. Assume that no lock is required
 	 * for this.
 	 */
-	MyWalSnd->pid = 0;
-	DisownLatch(&MyWalSnd->latch);
-
-	/* WalSnd struct isn't mine anymore */
-	MyWalSnd = NULL;
+	walsnd->pid = 0;
 }
 
 /*
@@ -1944,7 +2138,6 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 	{
 		/* use volatile pointer to prevent code rearrangement */
 		volatile WalSnd *walsnd = &WalSndCtl->walsnds[i];
-		char		location[MAXFNAMELEN];
 		XLogRecPtr	sentPtr;
 		XLogRecPtr	write;
 		XLogRecPtr	flush;
@@ -1978,28 +2171,19 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 		else
 		{
 			values[1] = CStringGetTextDatum(WalSndGetStateString(state));
-
-			snprintf(location, sizeof(location), "%X/%X",
-					 (uint32) (sentPtr >> 32), (uint32) sentPtr);
-			values[2] = CStringGetTextDatum(location);
+			values[2] = LSNGetDatum(sentPtr);
 
 			if (write == 0)
 				nulls[3] = true;
-			snprintf(location, sizeof(location), "%X/%X",
-					 (uint32) (write >> 32), (uint32) write);
-			values[3] = CStringGetTextDatum(location);
+			values[3] = LSNGetDatum(write);
 
 			if (flush == 0)
 				nulls[4] = true;
-			snprintf(location, sizeof(location), "%X/%X",
-					 (uint32) (flush >> 32), (uint32) flush);
-			values[4] = CStringGetTextDatum(location);
+			values[4] = LSNGetDatum(flush);
 
 			if (apply == 0)
 				nulls[5] = true;
-			snprintf(location, sizeof(location), "%X/%X",
-					 (uint32) (apply >> 32), (uint32) apply);
-			values[5] = CStringGetTextDatum(location);
+			values[5] = LSNGetDatum(apply);
 
 			values[6] = Int32GetDatum(sync_priority[i]);
 

@@ -10,12 +10,14 @@
 #include "catalog/pg_cast.h"
 #include "funcapi.h"
 #include "libpq/pqformat.h"
+#include "miscadmin.h"
 #include "parser/parse_coerce.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/json.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
@@ -94,13 +96,15 @@ recvHStoreValue(StringInfo buf, HStoreValue *v, uint32 level, int c)
 {
 	uint32  hentry = c & HENTRY_TYPEMASK;
 
+	check_stack_depth();
+
 	if (c == -1 /* compatibility */ || hentry == HENTRY_ISNULL)
 	{
 		v->type = hsvNull;
 		v->size = sizeof(HEntry);
 	}
 	else if (hentry == HENTRY_ISHASH || hentry == HENTRY_ISARRAY ||
-			 hentry == HENTRY_ISCALAR)
+			 hentry == HENTRY_ISSCALAR)
 	{
 		recvHStore(buf, v, level + 1, (uint32)c);
 	}
@@ -122,13 +126,15 @@ recvHStoreValue(StringInfo buf, HStoreValue *v, uint32 level, int c)
 	else if (hentry == HENTRY_ISSTRING)
 	{
 		v->type = hsvString;
-		v->string.val = pq_getmsgtext(buf, c, &c);
+		v->string.val = pq_getmsgtext(buf, c & ~HENTRY_TYPEMASK, &c);
 		v->string.len = hstoreCheckKeyLen(c);
 		v->size = sizeof(HEntry) + v->string.len;
 	}
 	else
 	{
-		elog(ERROR, "bogus input");
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+				 errmsg("unknown hstore value")));
 	}
 }
 
@@ -143,11 +149,20 @@ recvHStore(StringInfo buf, HStoreValue *v, uint32 level, uint32 header)
 	if (level == 0 && hentry == 0)
 		hentry = HENTRY_ISHASH; /* old version */
 
+	check_stack_depth();
+
 	v->size = 3 * sizeof(HEntry);
 	if (hentry == HENTRY_ISHASH)
 	{
 		v->type = hsvHash;
 		v->hash.npairs = header & HS_COUNT_MASK;
+
+		if (v->hash.npairs > (buf->len  - buf->cursor) / (2 * sizeof(uint32)) ||
+			v->hash.npairs > MaxAllocSize / sizeof(HStorePair))
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("too much elements in hstore hash")));
+
 		if (v->hash.npairs > 0)
 		{
 			v->hash.pairs = palloc(sizeof(*v->hash.pairs) * v->hash.npairs);
@@ -157,7 +172,9 @@ recvHStore(StringInfo buf, HStoreValue *v, uint32 level, uint32 header)
 				recvHStoreValue(buf, &v->hash.pairs[i].key, level,
 								pq_getmsgint(buf, 4));
 				if (v->hash.pairs[i].key.type != hsvString)
-					elog(ERROR, "hstore's key could be only a string");
+					ereport(ERROR,
+							(errcode(ERRCODE_DATATYPE_MISMATCH),
+							 errmsg("hstore's key could be only a string")));
 
 				recvHStoreValue(buf, &v->hash.pairs[i].value, level,
 								pq_getmsgint(buf, 4));
@@ -169,14 +186,22 @@ recvHStore(StringInfo buf, HStoreValue *v, uint32 level, uint32 header)
 			uniqueHStoreValue(v);
 		}
 	}
-	else if (hentry == HENTRY_ISARRAY || hentry == HENTRY_ISCALAR)
+	else if (hentry == HENTRY_ISARRAY || hentry == HENTRY_ISSCALAR)
 	{
 		v->type = hsvArray;
 		v->array.nelems = header & HS_COUNT_MASK;
-		v->array.scalar = (hentry == HENTRY_ISCALAR) ? true : false;
+		v->array.scalar = (hentry == HENTRY_ISSCALAR) ? true : false;
+
+		if (v->array.nelems > (buf->len  - buf->cursor) / sizeof(uint32) ||
+			v->array.nelems > MaxAllocSize / sizeof(HStoreValue))
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("too much elements in hstore array")));
 
 		if (v->array.scalar && v->array.nelems != 1)
-			elog(ERROR, "bogus input");
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+					 errmsg("wrong scalar representation")));
 
 		if (v->array.nelems > 0)
 		{
@@ -192,7 +217,9 @@ recvHStore(StringInfo buf, HStoreValue *v, uint32 level, uint32 header)
 	}
 	else
 	{
-			elog(ERROR, "bogus input");
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+				 errmsg("unknown hstore element")));
 	}
 }
 
@@ -495,6 +522,13 @@ hstore_from_arrays(PG_FUNCTION_ARGS)
 					  TEXTOID, -1, false, 'i',
 					  &key_datums, &key_nulls, &key_count);
 
+	/* see discussion in arrayToHStoreSortedArray() */
+	if (key_count > MaxAllocSize / sizeof(HStorePair))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			  errmsg("number of pairs (%d) exceeds the maximum allowed (%d)",
+					 key_count, (int) (MaxAllocSize / sizeof(HStorePair)))));
+
 	/* value_array might be NULL */
 
 	if (PG_ARGISNULL(1))
@@ -619,6 +653,13 @@ hstore_from_array(PG_FUNCTION_ARGS)
 					  &in_datums, &in_nulls, &in_count);
 
 	count = in_count / 2;
+
+	/* see discussion in arrayToHStoreSortedArray() */
+	if (count > MaxAllocSize / sizeof(HStorePair))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			  errmsg("number of pairs (%d) exceeds the maximum allowed (%d)",
+					 count, (int) (MaxAllocSize / sizeof(HStorePair)))));
 
 	v.type = hsvHash;
 	v.size = 2*sizeof(HEntry);
@@ -757,6 +798,7 @@ hstore_from_record(PG_FUNCTION_ARGS)
 	v.type = hsvHash;
 	v.size = 2*sizeof(HEntry);
 	v.hash.npairs = ncolumns;
+	Assert(ncolumns <= MaxTupleAttributeNumber);		/* thus, no overflow */
 	v.hash.pairs = palloc(ncolumns * sizeof(HStorePair));
 
 	if (rec)
@@ -1365,6 +1407,11 @@ reout:
 				{
 					Assert(type == WHS_BEGIN_HASH || type == WHS_BEGIN_ARRAY);
 					printCR(out, kind);
+					/*
+					 * We need to rerun current switch() due to put
+					 * in current place object which we just got
+					 * from iterator.
+					 */
 					goto reout;
 				}
 				break;
@@ -1497,7 +1544,7 @@ hstore_send(PG_FUNCTION_ARGS)
 			switch(type)
 			{
 				case WHS_BEGIN_ARRAY:
-					flag = (v.array.scalar) ? HENTRY_ISCALAR : HENTRY_ISARRAY;
+					flag = (v.array.scalar) ? HENTRY_ISSCALAR : HENTRY_ISARRAY;
 					pq_sendint(&buf, v.array.nelems | flag, 4);
 					break;
 				case WHS_BEGIN_HASH:
@@ -1523,8 +1570,8 @@ hstore_send(PG_FUNCTION_ARGS)
 							break;
 						case hsvNumeric:
 							nbuf = DatumGetByteaP(DirectFunctionCall1(numeric_send, NumericGetDatum(v.numeric)));
-							pq_sendint(&buf, VARSIZE_ANY(nbuf) | HENTRY_ISNUMERIC, 4);
-							pq_sendbytes(&buf, (char*)nbuf, VARSIZE_ANY(nbuf));
+							pq_sendint(&buf, ((int)VARSIZE_ANY_EXHDR(nbuf)) | HENTRY_ISNUMERIC, 4);
+							pq_sendbytes(&buf, VARDATA(nbuf), (int)VARSIZE_ANY_EXHDR(nbuf));
 							break;
 						default:
 							elog(PANIC, "Wrong type: %u", v.type);

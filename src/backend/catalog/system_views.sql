@@ -586,6 +586,8 @@ CREATE VIEW pg_stat_activity AS
             S.state_change,
             S.waiting,
             S.state,
+            S.backend_xid,
+            s.backend_xmin,
             S.query
     FROM pg_database D, pg_stat_get_activity(NULL) AS S, pg_authid U
     WHERE S.datid = D.oid AND
@@ -601,6 +603,7 @@ CREATE VIEW pg_stat_replication AS
             S.client_hostname,
             S.client_port,
             S.backend_start,
+            S.backend_xmin,
             W.state,
             W.sent_location,
             W.write_location,
@@ -612,6 +615,18 @@ CREATE VIEW pg_stat_replication AS
             pg_stat_get_wal_senders() AS W
     WHERE S.usesysid = U.oid AND
             S.pid = W.pid;
+
+CREATE VIEW pg_replication_slots AS
+    SELECT
+            L.slot_name,
+            L.slot_type,
+            L.datoid,
+            D.datname AS database,
+            L.active,
+            L.xmin,
+            L.restart_lsn
+    FROM pg_get_replication_slots() AS L
+            LEFT JOIN pg_database D ON (L.datoid = D.oid);
 
 CREATE VIEW pg_stat_database AS
     SELECT
@@ -798,7 +813,7 @@ COMMENT ON FUNCTION ts_debug(text) IS
 
 CREATE OR REPLACE FUNCTION
   pg_start_backup(label text, fast boolean DEFAULT false)
-  RETURNS text STRICT VOLATILE LANGUAGE internal AS 'pg_start_backup';
+  RETURNS pg_lsn STRICT VOLATILE LANGUAGE internal AS 'pg_start_backup';
 
 CREATE OR REPLACE FUNCTION
   json_populate_record(base anyelement, from_json json, use_json_as_text boolean DEFAULT false)
