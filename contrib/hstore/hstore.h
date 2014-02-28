@@ -251,7 +251,7 @@ extern	int /* WHS_* */	HStoreIteratorGet(HStoreIterator **it, HStoreValue *v,
 										  bool skipNested);
 
 #define HStoreContainsStrategyNumber	7
-#define HStoreExistsStrategyNumber		9
+#define HStoreExistsStrategyNumber	9
 #define HStoreExistsAnyStrategyNumber	10
 #define HStoreExistsAllStrategyNumber	11
 #define HStoreOldContainsStrategyNumber 13		/* backwards compatibility */
@@ -278,10 +278,11 @@ extern	int /* WHS_* */	HStoreIteratorGet(HStoreIterator **it, HStoreValue *v,
 
 /*
  * When using a GIN/GiST index for hstore, we choose to index both keys and values.
- * The storage format is "text" values, with K, V, or N prepended to the string
- * to indicate key, value, or null values.  (As of 9.1 it might be better to
+ * The storage format is "text" values, with K, V, E or N prepended to the string
+ * to indicate key, value, element or null values.  (As of 9.1 it might be better to
  * store null values as nulls, but we'll keep it this way for on-disk
- * compatibility.)
+ * compatibility.) Before nested hstore GIN indexes used KV notation, so there is 
+ * no problem with upgrade, but GiST indexes should be rebuilded.
  */
 #define ELEMFLAG    'E'
 #define KEYFLAG     'K'
