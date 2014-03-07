@@ -196,7 +196,7 @@ SELECT 'a=&gt;1,a=&gt;2'::hstore;
  </sect2>
 
  <sect2>
-  <title>Ouput Format Configuration Parameters</title>
+  <title>Output Format Configuration Parameters</title>
 
   <para>
    There are several configuration parameters that control the output formatting of
